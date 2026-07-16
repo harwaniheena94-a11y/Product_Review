@@ -3,12 +3,12 @@ import os
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from html import escape
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
 
 import pandas as pd
 import requests
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse, Response
 
 
 def load_environment_file():
@@ -215,65 +215,56 @@ def parse_date_range(data):
     return start_date, end_date
 
 
-class LeadExportHandler(BaseHTTPRequestHandler):
-    def send_html(self, content, status=200):
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(content.encode())))
-        self.end_headers()
-        self.wfile.write(content.encode())
+app = FastAPI(title="ProductReview Leads")
 
-    def do_GET(self):
-        self.send_html(render_page() if self.path == "/" else "Not found", 200 if self.path == "/" else 404)
 
-    def do_HEAD(self):
-        status = 200 if self.path == "/" else 404
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return render_page()
 
-    def do_POST(self):
-        if self.path not in {"/preview", "/download"}:
-            self.send_html("Not found", 404)
-            return
-        try:
-            size = int(self.headers.get("Content-Length", 0))
-            data = parse_qs(self.rfile.read(size).decode())
-            if self.path == "/preview":
-                start_date, end_date = parse_date_range(data)
-                records = [message_to_record(message) for message in get_messages(start_date, end_date)]
-                preview_id = uuid4().hex
-                PREVIEWS[preview_id] = {"records": records, "start_date": start_date, "end_date": end_date}
-                self.send_html(render_preview(records, start_date, end_date, preview_id))
-                return
 
-            preview_id = data.get("preview_id", [""])[0]
-            preview = PREVIEWS.get(preview_id)
-            if not preview:
-                raise ValueError("This preview has expired. Generate a new preview before downloading.")
-            workbook = create_workbook(preview["records"])
-            start_date = preview["start_date"]
-            end_date = preview["end_date"]
-            filename = f"ProductReview_Leads_{start_date:%Y%m%d}_{end_date:%Y%m%d}.xlsx"
-            self.send_response(200)
-            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-            self.send_header("Content-Length", str(len(workbook.getvalue())))
-            self.end_headers()
-            self.wfile.write(workbook.getvalue())
-        except (ValueError, requests.RequestException, KeyError) as error:
-            self.send_html(render_page(str(error)), 400)
-        except Exception:
-            self.log_error("Unexpected error while generating lead export")
-            self.send_html(render_page("Unable to generate the Excel file. Check the server terminal and try again."), 500)
+@app.post("/preview", response_class=HTMLResponse)
+def preview(start_date: str = Form(...), end_date: str = Form(...)):
+    try:
+        start_date, end_date = parse_date_range({"start_date": [start_date], "end_date": [end_date]})
+        records = [message_to_record(message) for message in get_messages(start_date, end_date)]
+        preview_id = uuid4().hex
+        PREVIEWS[preview_id] = {"records": records, "start_date": start_date, "end_date": end_date}
+        return render_preview(records, start_date, end_date, preview_id)
+    except (ValueError, requests.RequestException, KeyError) as error:
+        return HTMLResponse(render_page(str(error)), status_code=400)
+    except Exception:
+        return HTMLResponse(
+            render_page("Unable to generate the Excel file. Check the server terminal and try again."),
+            status_code=500,
+        )
+
+
+@app.post("/download")
+def download(preview_id: str = Form(...)):
+    try:
+        preview = PREVIEWS.get(preview_id)
+        if not preview:
+            raise ValueError("This preview has expired. Generate a new preview before downloading.")
+        workbook = create_workbook(preview["records"])
+        start_date = preview["start_date"]
+        end_date = preview["end_date"]
+        filename = f"ProductReview_Leads_{start_date:%Y%m%d}_{end_date:%Y%m%d}.xlsx"
+        return Response(
+            content=workbook.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except (ValueError, requests.RequestException, KeyError) as error:
+        return HTMLResponse(render_page(str(error)), status_code=400)
+    except Exception:
+        return HTMLResponse(
+            render_page("Unable to generate the Excel file. Check the server terminal and try again."),
+            status_code=500,
+        )
 
 
 if __name__ == "__main__":
-    host = "0.0.0.0"
-    port = int(os.environ.get("PORT", 8000))
+    import uvicorn
 
-    server = HTTPServer((host, port), LeadExportHandler)
-
-    print(f"Server running on http://{host}:{port}")
-
-    server.serve_forever()
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

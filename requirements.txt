@@ -1,3 +1,6 @@
 pandas
 openpyxl
 requests
+fastapi
+uvicorn
+python-multipart
