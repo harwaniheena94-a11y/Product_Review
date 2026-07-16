@@ -226,6 +226,12 @@ class LeadExportHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_html(render_page() if self.path == "/" else "Not found", 200 if self.path == "/" else 404)
 
+    def do_HEAD(self):
+        status = 200 if self.path == "/" else 404
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
     def do_POST(self):
         if self.path not in {"/preview", "/download"}:
             self.send_html("Not found", 404)
