@@ -1,12 +1,13 @@
 import io
 import os
-from uuid import uuid4
+import html
+import uuid
 from datetime import datetime, timedelta, timezone
-from html import escape
 from pathlib import Path
 
 import pandas as pd
 import requests
+import uvicorn
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, Response
 
@@ -31,13 +32,8 @@ load_environment_file()
 
 USER_EMAIL = os.getenv("PRODUCT_REVIEW_USER_EMAIL", "leads@sunboost.com.au")
 SENDER = os.getenv("PRODUCT_REVIEW_SENDER", "dev@productreview.com.au")
-EXPORT_COLUMNS = (
-    "Title", "First Name", "Last Name", "Mobile Number", "Home Phone", "Email",
-    "Lead Source", "Fax", "Notes", "Unit Type", "Unit Number", "Address Type",
-    "Address", "Street Number", "Street Name", "Street Type", "Suburb", "Post Code",
-    "State", "Lead Date",
-)
-PREVIEWS = {}
+SOLAR_CRM_IMPORT_URL = "https://app.solarcrm.com.au/backend/api/leads/import/excel/internal"
+SOLAR_CRM_ORGANIZATION_ID = os.getenv("SOLAR_CRM_ORGANIZATION_ID", "2")
 
 
 def get_credentials():
@@ -83,18 +79,16 @@ def get_messages(start_date, end_date):
         "&$select=subject,receivedDateTime,body,from"
         "&$orderby=receivedDateTime desc"
     )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Prefer": 'outlook.body-content-type="text"',
-    }
-    messages = []
-    while url:
-        response = requests.get(url, headers=headers, timeout=60)
-        response.raise_for_status()
-        payload = response.json()
-        messages.extend(payload.get("value", []))
-        url = payload.get("@odata.nextLink")
-    return messages
+    response = requests.get(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Prefer": 'outlook.body-content-type="text"',
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json().get("value", [])
 
 
 def state_from_postcode(postcode):
@@ -130,29 +124,34 @@ def message_to_record(message):
     mobile_number = answers.get("What is your mobile number?", "").replace(" ", "")
     if mobile_number.startswith("+61"):
         mobile_number = "" + mobile_number[3:]
+    mobile_number = int(mobile_number) if mobile_number.isdigit() else None
     lead_date = message.get("receivedDateTime", "")
     if lead_date:
-        lead_date = datetime.fromisoformat(lead_date.replace("Z", "+00:00")).strftime("%m/%d/%Y")
-    postcode = answers.get("What is your postcode?", "")
+        lead_date = datetime.fromisoformat(
+    lead_date.replace("Z", "+00:00")
+).date()
+    postcode = answers.get("What is your postcode?", "").strip()
+
+    postcode = int(postcode) if postcode.isdigit() else None
 
     return {
-        "Title": "",
+        "Title": None,
         "First Name": name_parts[0] if name_parts else "",
         "Last Name": name_parts[1] if len(name_parts) > 1 else "",
         "Mobile Number": mobile_number,
-        "Home Phone": "",
+        "Home Phone": None,
         "Email": answers.get("What is your email address?", ""),
         "Lead Source": "ProductReview",
-        "Fax": "",
-        "Notes": "",
-        "Unit Type": "",
-        "Unit Number": "",
-        "Address Type": "",
+        "Fax": None,
+        "Notes": None,
+        "Unit Type": None,
+        "Unit Number": None,
+        "Address Type": None,
         "Address": answers.get("What is the street address where the system will be installed?", ""),
-        "Street Number": "",
-        "Street Name": "",
-        "Street Type": "",
-        "Suburb": "",
+        "Street Number": None,
+        "Street Name": None,
+        "Street Type": None,
+        "Suburb": None,
         "Post Code": postcode,
         "State": state_from_postcode(postcode),
         "Lead Date": lead_date,
@@ -162,9 +161,34 @@ def message_to_record(message):
 def create_workbook(records):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(records, columns=EXPORT_COLUMNS).to_excel(writer, index=False, sheet_name="ProductReview Leads")
+        pd.DataFrame(records).to_excel(writer, index=False, sheet_name="ProductReview Leads")
     output.seek(0)
     return output
+
+
+def upload_to_solar_crm(filename, workbook):
+    """Upload one generated Excel workbook to SolarCRM."""
+    internal_secret = os.getenv("SOLAR_CRM_INTERNAL_SECRET")
+    if not internal_secret:
+        raise ValueError("SolarCRM is not configured. Set SOLAR_CRM_INTERNAL_SECRET in .env.")
+
+    response = requests.post(
+        SOLAR_CRM_IMPORT_URL,
+        headers={
+            "X-Internal-Secret": internal_secret,
+            "OrganizationId": SOLAR_CRM_ORGANIZATION_ID,
+        },
+        files={
+            "files[]": (
+                filename,
+                workbook,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response
 
 
 PAGE = """<!doctype html>
@@ -180,42 +204,28 @@ form { margin-top:32px; padding:28px; border:1px solid var(--line); border-radiu
 .dates { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin:24px 0 28px; } label { font-weight:700; font-size:14px; } input { width:100%; margin-top:8px; border:1px solid #aebcc4; border-radius:4px; padding:12px; color:var(--ink); font:inherit; } input:focus { outline:3px solid #bce6e2; border-color:var(--accent); }
 button { width:100%; border:0; border-radius:4px; background:var(--accent); color:#fff; padding:13px 18px; font:700 16px Arial,sans-serif; cursor:pointer; } button:hover { background:var(--accent-dark); } button:disabled { opacity:.7; cursor:wait; }
 .notice { margin-top:20px; padding:12px; border-left:3px solid var(--accent); background:#edf8f7; color:#285653; font-size:14px; } .error { border-color:#b42318; background:#fff2f0; color:#8a1c15; }
+.preview { margin-top:24px; overflow-x:auto; border:1px solid var(--line); border-radius:4px; } table { width:100%; border-collapse:collapse; font-size:14px; } th,td { padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); white-space:nowrap; } th { background:#f3f6f6; } tr:last-child td { border-bottom:0; } .export-actions { display:flex; gap:12px; margin-top:20px; } .export-actions form { flex:1; margin:0; padding:0; border:0; box-shadow:none; background:transparent; } .export-actions button { width:100%; }
 @media (max-width:520px) { main { padding-top:48px; } h1 { font-size:28px; } form { padding:22px; } .dates { grid-template-columns:1fr; } }
-</style></head><body><main><div class="brand"><span class="brand-mark">P</span>ProductReview Leads</div><h1>Preview lead emails</h1><p>Select the inclusive date range for the unread ProductReview emails you want to review.</p><form method="post" action="/preview"><div class="dates"><label>From date<input type="date" name="start_date" max="__MAX_DATE__" required></label><label>To date<input type="date" name="end_date" max="__MAX_DATE__" required></label></div><button type="submit">Generate preview</button></form><div class="notice">The file includes only unread leads received from the configured ProductReview sender.</div></main><script>document.querySelector('form').addEventListener('submit', function () { const b=this.querySelector('button'); b.disabled=true; b.textContent='Generating preview...'; });</script></body></html>"""
+</style></head><body><main><div class="brand"><span class="brand-mark">P</span>ProductReview Leads</div><h1>Export lead emails</h1><p>Select the inclusive date range for the ProductReview emails you want in the Excel file.</p><form method="post" action="/generate"><div class="dates"><label>From date<input type="date" name="start_date" required></label><label>To date<input type="date" name="end_date" required></label></div><button type="submit">Generate preview</button></form>{{CONTENT}}<div class="notice">The file includes leads received from the configured ProductReview sender.</div></main><script>document.querySelector('form').addEventListener('submit', function () { const b=this.querySelector('button'); b.disabled=true; b.textContent='Generating preview...'; });</script></body></html>"""
+
+EXPORTS = {}
+app = FastAPI(title="ProductReview Leads")
 
 
-def render_page(error_message=""):
-    page = PAGE.replace("__MAX_DATE__", datetime.now().date().isoformat())
-    if error_message:
-        error_html = f'<div class="notice error">{escape(error_message)}</div>'
-        return page.replace('<div class="notice">', f"{error_html}<div class=\"notice\">")
-    return page
+def render_page(content=""):
+    return PAGE.replace("{{CONTENT}}", content)
 
 
-def render_preview(records, start_date, end_date, preview_id):
-    headers = "".join(f"<th>{escape(column)}</th>" for column in EXPORT_COLUMNS)
+def preview_html(records, token):
     rows = "".join(
-        "<tr>" + "".join(f"<td>{escape(str(record.get(column, '')))}</td>" for column in EXPORT_COLUMNS) + "</tr>"
+        "<tr>" + "".join(f"<td>{html.escape(str(record.get(column, '')))}</td>" for column in ("First Name", "Last Name", "Email", "Mobile Number", "Post Code", "State", "Lead Date")) + "</tr>"
         for record in records
     )
-    table = f"<div class=\"table-wrap\"><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div>" if records else "<div class=\"notice\">No unread ProductReview leads were found for this date range.</div>"
-    download = f'<form method="post" action="/download"><input type="hidden" name="preview_id" value="{preview_id}"><button type="submit">Download Excel</button></form>' if records else ""
-    return f"""<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Lead Preview</title><style>
-    :root {{ --ink:#13212c; --muted:#61717c; --line:#d7e0e5; --accent:#007c78; --accent-dark:#005e5b; --surface:#fff; --bg:#f3f6f6; }} * {{ box-sizing:border-box }} body {{ margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 Arial,sans-serif }} main {{ width:min(1440px,calc(100% - 32px)); margin:0 auto; padding:48px 0 }} .brand {{ color:var(--accent); font-weight:700 }} h1 {{ margin:22px 0 4px; font-size:30px }} p {{ margin:0; color:var(--muted) }} .actions {{ display:flex; gap:12px; align-items:center; margin:26px 0 18px }} a {{ color:var(--accent); font-weight:700; text-decoration:none }} form {{ margin:0 }} button {{ border:0; border-radius:4px; background:var(--accent); color:#fff; padding:12px 20px; font:700 15px Arial,sans-serif; cursor:pointer }} button:hover {{ background:var(--accent-dark) }} .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:8px; background:var(--surface) }} table {{ width:100%; min-width:1300px; border-collapse:collapse; font-size:14px }} th {{ background:#e8f4f2; text-align:left; white-space:nowrap; font-weight:700 }} th,td {{ padding:11px 12px; border-bottom:1px solid var(--line); vertical-align:top }} td {{ max-width:280px; overflow-wrap:anywhere }} tr:last-child td {{ border-bottom:0 }} .notice {{ padding:14px; border-left:3px solid var(--accent); background:#edf8f7; color:#285653 }} @media (max-width:520px) {{ main {{ width:calc(100% - 24px); padding-top:32px }} .actions {{ align-items:stretch; flex-direction:column }} button {{ width:100% }} }}</style></head><body><main><div class=\"brand\">ProductReview Leads</div><h1>Lead preview</h1><p>{len(records)} unread lead{'s' if len(records) != 1 else ''} from {start_date:%m/%d/%Y} to {end_date:%m/%d/%Y}.</p><div class=\"actions\"><a href=\"/\">Change dates</a>{download}</div>{table}</main></body></html>"""
-
-
-def parse_date_range(data):
-    start_date = datetime.strptime(data.get("start_date", [""])[0], "%Y-%m-%d").date()
-    end_date = datetime.strptime(data.get("end_date", [""])[0], "%Y-%m-%d").date()
-    if end_date < start_date:
-        raise ValueError("The end date must be the same as or later than the start date.")
-    today = datetime.now().date()
-    if start_date > today or end_date > today:
-        raise ValueError("Invalid date. Please select today or an earlier date.")
-    return start_date, end_date
-
-
-app = FastAPI(title="ProductReview Leads")
+    if not rows:
+        rows = '<tr><td colspan="7">No leads found for this date range.</td></tr>'
+    return f'''<div class="notice"><strong>Preview ready:</strong> {len(records)} lead(s) found. Review the results, then download when ready.</div>
+<div class="preview"><table><thead><tr><th>First name</th><th>Last name</th><th>Email</th><th>Mobile</th><th>Postcode</th><th>State</th><th>Lead date</th></tr></thead><tbody>{rows}</tbody></table></div>
+<div class="export-actions"><form method="post" action="/download"><input type="hidden" name="token" value="{token}"><button type="submit">Download Excel</button></form><form method="post" action="/upload"><input type="hidden" name="token" value="{token}"><button type="submit">Upload to SolarCRM</button></form></div>'''
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -223,48 +233,76 @@ def home():
     return render_page()
 
 
-@app.post("/preview", response_class=HTMLResponse)
-def preview(start_date: str = Form(...), end_date: str = Form(...)):
+@app.head("/")
+def home_head():
+    """Respond successfully to health checks and other HEAD requests."""
+    return Response(status_code=200)
+
+
+@app.post("/generate", response_class=HTMLResponse)
+def generate_preview(start_date: str = Form(...), end_date: str = Form(...)):
     try:
-        start_date, end_date = parse_date_range({"start_date": [start_date], "end_date": [end_date]})
-        records = [message_to_record(message) for message in get_messages(start_date, end_date)]
-        preview_id = uuid4().hex
-        PREVIEWS[preview_id] = {"records": records, "start_date": start_date, "end_date": end_date}
-        return render_preview(records, start_date, end_date, preview_id)
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        if end < start:
+            raise ValueError("The end date must be the same as or later than the start date.")
+
+        records = [message_to_record(message) for message in get_messages(start, end)]
+        workbook = create_workbook(records).getvalue()
+        filename = f"ProductReview_Leads_{start:%Y%m%d}_{end:%Y%m%d}.xlsx"
+        token = uuid.uuid4().hex
+        EXPORTS[token] = (filename, workbook)
+        return render_page(preview_html(records, token))
     except (ValueError, requests.RequestException, KeyError) as error:
-        return HTMLResponse(render_page(str(error)), status_code=400)
-    except Exception:
         return HTMLResponse(
-            render_page("Unable to generate the Excel file. Check the server terminal and try again."),
-            status_code=500,
+            render_page(f'<div class="notice error">{html.escape(str(error))}</div>'),
+            status_code=400,
         )
 
 
 @app.post("/download")
-def download(preview_id: str = Form(...)):
-    try:
-        preview = PREVIEWS.get(preview_id)
-        if not preview:
-            raise ValueError("This preview has expired. Generate a new preview before downloading.")
-        workbook = create_workbook(preview["records"])
-        start_date = preview["start_date"]
-        end_date = preview["end_date"]
-        filename = f"ProductReview_Leads_{start_date:%Y%m%d}_{end_date:%Y%m%d}.xlsx"
-        return Response(
-            content=workbook.getvalue(),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-    except (ValueError, requests.RequestException, KeyError) as error:
-        return HTMLResponse(render_page(str(error)), status_code=400)
-    except Exception:
+def download_excel(token: str = Form(...)):
+    export = EXPORTS.get(token)
+    if not export:
         return HTMLResponse(
-            render_page("Unable to generate the Excel file. Check the server terminal and try again."),
-            status_code=500,
+            render_page('<div class="notice error">This preview has expired. Please generate it again.</div>'),
+            status_code=400,
         )
+
+    filename, workbook = export
+    return Response(
+        content=workbook,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/upload", response_class=HTMLResponse)
+def upload_excel(token: str = Form(...)):
+    export = EXPORTS.get(token)
+    if not export:
+        return HTMLResponse(
+            render_page('<div class="notice error">This preview has expired. Please generate it again.</div>'),
+            status_code=400,
+        )
+
+    filename, workbook = export
+    try:
+        upload_to_solar_crm(filename, workbook)
+    except ValueError as error:
+        return HTMLResponse(render_page(f'<div class="notice error">{html.escape(str(error))}</div>'), status_code=400)
+    except requests.RequestException:
+        return HTMLResponse(
+            render_page('<div class="notice error">SolarCRM could not accept the file. Please try again.</div>'),
+            status_code=502,
+        )
+
+    EXPORTS.pop(token, None)
+    return render_page('<div class="notice"><strong>Upload complete.</strong> The Excel file has been sent to SolarCRM.</div>')
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    host = "127.0.0.1"
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Open http://{host}:{port} in your browser")
+    uvicorn.run(app, host=host, port=port)
