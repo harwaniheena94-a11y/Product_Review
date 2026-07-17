@@ -160,8 +160,20 @@ def message_to_record(message):
 
 def create_workbook(records):
     output = io.BytesIO()
+    dataframe = pd.DataFrame(records)
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(records).to_excel(writer, index=False, sheet_name="ProductReview Leads")
+        dataframe.to_excel(writer, index=False, sheet_name="ProductReview Leads")
+        worksheet = writer.sheets["ProductReview Leads"]
+
+        # SolarCRM treats an explicit empty Unit Type cell as provided, then
+        # requires Unit Number. Remove blank cells entirely from the workbook.
+        for field in ("Unit Type", "Unit Number"):
+            if field not in dataframe.columns:
+                continue
+            column = dataframe.columns.get_loc(field) + 1
+            for row, value in enumerate(dataframe[field], start=2):
+                if value is None or value == "" or pd.isna(value):
+                    worksheet.cell(row=row, column=column).value = None
     output.seek(0)
     return output
 
